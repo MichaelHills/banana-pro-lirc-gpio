@@ -1,0 +1,222 @@
+#! /bin/sh
+### BEGIN INIT INFO
+# Provides:          lirc
+# Required-Start:    $remote_fs $syslog
+# Required-Stop:     $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Starts LIRC daemon.
+# Description:       LIRC is used to control different
+#                    infrared receivers and transceivers.
+### END INIT INFO
+
+# Inspired by https://gist.github.com/zerkalica/f1c3a0a889cd974c495d
+
+RECEIVER_PID_FILE=/var/run/lirc/lircd-rx.pid
+TRANSMITTER_PID_FILE=/var/run/lirc/lircd-tx.pid
+TRANSMITTER_SOCKET=/var/run/lirc/lircd-tx
+
+load_modules ()
+{
+	MODULES_MISSING=false
+
+	log_daemon_msg "Loading LIRC modules"
+	for mod in $*; do
+		if [ $mod = "udev" ]; then
+			log_end_msg 0
+			log_success_msg "Restarted via udev, don't reload modules"
+			break
+		else
+			modprobe $mod 2> /dev/null || MODULES_MISSING=true
+		fi
+	done
+	log_end_msg $?
+
+	if $MODULES_MISSING; then
+		log_failure_msg "Unable to load LIRC kernel modules. Verify your"
+		log_failure_msg "selected kernel modules in /etc/lirc/hardware.conf"
+		START_LIRCMD=false
+		START_LIRCD=false
+	fi
+}
+
+build_receiver_args ()
+{
+	ARGS="$*"
+
+	## Try to find an lirc device.
+	if [ -z "$RECEIVER_DEVICE" ]; then
+		if [ -c $dev ]; then
+			RECEIVER_DEVICE="$dev"
+			break
+		fi
+	fi
+
+	if [ -n "$RECEIVER_DEVICE" ] && [ "$RECEIVER_DEVICE" != "none" ]; then
+		ARGS="--device=$RECEIVER_DEVICE $ARGS"
+	fi
+
+	if [ -n "$RECEIVER_DRIVER" ] && [ "$RECEIVER_DRIVER" != "none" ]; then
+		ARGS="--driver=$RECEIVER_DRIVER $ARGS"
+	fi
+
+	ARGS="$ARGS --pidfile=$RECEIVER_PID_FILE"
+
+	echo $ARGS
+}
+
+build_transmitter_args ()
+{
+	ARGS="$*"
+
+	## Try to find an lirc device.
+	if [ -z "$TRANSMITTER_DEVICE" ]; then
+		if [ -c $dev ]; then
+			TRANSMITTER_DEVICE="$dev"
+			break
+		fi
+	fi
+
+	if [ -n "$TRANSMITTER_DEVICE" ] && [ "$TRANSMITTER_DEVICE" != "none" ]; then
+		ARGS="--device=$TRANSMITTER_DEVICE $ARGS"
+	fi
+
+	if [ -n "$TRANSMITTER_DRIVER" ] && [ "$TRANSMITTER_DRIVER" != "none" ]; then
+		ARGS="--driver=$TRANSMITTER_DRIVER $ARGS"
+	fi
+
+	ARGS="$ARGS --pidfile=$TRANSMITTER_PID_FILE --output=$TRANSMITTER_SOCKET"
+
+	echo $ARGS
+}
+
+. /lib/lsb/init-functions
+
+test -f /usr/sbin/lircd || exit 0
+test -f /usr/sbin/lircmd || exit 0
+
+START_LIRCMD=true
+START_LIRCD=true
+START_IREXEC=true
+
+
+if [ -f /etc/lirc/hardware.conf ];then
+	. /etc/lirc/hardware.conf
+fi
+
+if [ ! -f /etc/lirc/lircd.conf ] || grep -q "^#UNCONFIGURED" /etc/lirc/lircd.conf; then
+	if [ "$1" = "start" ]; then
+		log_success_msg "No valid /etc/lirc/lircd.conf has been found."
+		log_success_msg "Remote control support has been disabled."
+		log_success_msg "Reconfigure LIRC or manually replace /etc/lirc/lircd.conf to enable."
+	fi
+
+	START_LIRCD=false
+	START_LIRCMD=false
+	START_IREXEC=false
+fi
+
+if [ ! -f /etc/lirc/lircmd.conf ] || grep -q "^#UNCONFIGURED" /etc/lirc/lircmd.conf; then
+	START_LIRCMD=false
+fi
+
+if [ ! -f /etc/lirc/lircrc ] || grep -q "^#UNCONFIGURED" /etc/lirc/lircrc; then
+	START_IREXEC=false
+fi
+
+case "$1" in
+	start)
+		[ -d "/var/run/lirc" ] || mkdir -p "/var/run/lirc"
+		if [ "$RECEIVER_LOAD_MODULES" = "true" ] && [ "$START_LIRCD" = "true" ]; then
+			load_modules $2 $RECEIVER_MODULES
+		fi
+		if [ "$TRANSMITTER_LOAD_MODULES" = "true" ] && [ "$START_LIRCD" = "true" ]; then
+			load_modules $2 $TRANSMITTER_MODULES
+		fi
+
+		if [ "$START_LIRCD" = "true" ]; then
+			log_daemon_msg "Starting remote control receiver daemon : LIRC "
+			RECEIVER_LIRCD_ARGS=`build_receiver_args $RECEIVER_LIRCD_ARGS`
+
+			if [ ! -z "$RECEIVER_LIRCD_ARGS" ]; then
+				start-stop-daemon --start --quiet --oknodo --exec /usr/sbin/lircd --pidfile=$RECEIVER_PID_FILE -- $RECEIVER_LIRCD_ARGS < /dev/null
+				log_end_msg $?
+				# retain compatibility with old clients
+				ln -fs ../var/run/lirc/lircd /dev/lircd
+			else
+				log_end_msg 1
+			fi
+
+			log_daemon_msg "Starting remote control transmitter daemon : LIRC "
+
+			if [ -n "$TRANSMITTER_PIN" ] ; then
+				echo $TRANSMITTER_PIN > /sys/class/lirc_gpio/tx_gpio_pin
+			fi
+
+			TRANSMITTER_LIRCD_ARGS=`build_transmitter_args $TRANSMITTER_LIRCD_ARGS`
+
+			if [ ! -z "$TRANSMITTER_LIRCD_ARGS" ]; then
+				start-stop-daemon --start --quiet --oknodo --exec /usr/sbin/lircd --pidfile=$TRANSMITTER_PID_FILE -- $TRANSMITTER_LIRCD_ARGS < /dev/null
+				log_end_msg $?
+				ln -fs $TRANSMITTER_SOCKET /dev/lircd-tx
+			else
+				log_end_msg 1
+			fi
+		fi
+
+		if [ "$START_LIRCMD" = "true" ]; then
+			log_daemon_msg "Starting remote control mouse daemon : LIRCMD "
+			start-stop-daemon --start --quiet --oknodo --exec /usr/sbin/lircmd < /dev/null
+			log_end_msg $?
+		fi
+
+		if [ "$START_IREXEC" = "true" ]; then
+			log_daemon_msg "Starting execution daemon: irexec"
+			start-stop-daemon --start --quiet --oknodo --exec /usr/bin/irexec -- -d /etc/lirc/lircrc < /dev/null
+			log_end_msg $?
+		fi
+		;;
+	stop)
+		if [ "$START_IREXEC" = "true" ]; then
+			log_daemon_msg "Stopping execution daemon: irexec"
+			start-stop-daemon --stop --quiet --exec /usr/bin/irexec
+			log_end_msg $?
+		fi
+
+		if [ "$START_LIRCMD" = "true" ]; then
+			log_daemon_msg "Stopping remote control mouse daemon: LIRCMD"
+			start-stop-daemon --stop --quiet --exec /usr/sbin/lircmd
+			log_end_msg $?
+		fi
+
+		if [ "$START_LIRCD" = "true" ]; then
+			log_daemon_msg "Stopping remote control daemon(s): LIRC"
+			start-stop-daemon --stop --quiet --exec /usr/sbin/lircd
+			log_end_msg $?
+		fi
+		;;
+	reload|force-reload)
+		if [ "$START_IREXEC" = "true" ]; then
+			start-stop-daemon --stop --quiet --signal 1 --exec /usr/bin/irexec
+		fi
+
+		if [ "$START_LIRCD" = "true" ]; then
+			start-stop-daemon --stop --quiet --signal 1 --exec /usr/sbin/lircd
+		fi
+
+		if [ "$START_LIRCMD" = "true" ]; then
+			start-stop-daemon --stop --quiet --signal 1 --exec /usr/sbin/lircmd
+		fi
+		;;
+	restart)
+		$0 stop
+		sleep 1
+		#passes parameter $2 which is possibly our udev paramater
+		$0 start $2
+		;;
+	*)
+		echo "Usage: /etc/init.d/lircd {start|stop|reload|restart|force-reload}"
+	exit 1
+esac
+
+exit 0
